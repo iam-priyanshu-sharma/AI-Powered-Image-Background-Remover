@@ -1,10 +1,10 @@
 services:
   - type: web
-    name: Image-Background-Remover-Server
+    name: AI-Powered-Image-Background-Remover-Server
     env: node
     plan: free
     region: oregon
-    repo: "https://github.com/iam-priyanshu-sharma/AI-Powered-Image-Background-Remover.git"
+    repo: "-----YOUR GITHUB REPOSITORY LINK-----"
     branch: main
     buildCommand: "cd server && npm install"
     startCommand: "cd server && npm start"
@@ -25,8 +25,8 @@ services:
         sync: false
 
 staticSites:
-  - name: bg-removal-client
-    repo: "https://github.com/iam-priyanshu-sharma/AI-Powered-Image-Background-Remover.git"
+  - name: AI-Powered-Image-Background-Remover-Client
+    repo: "-----YOUR GITHUB REPOSITORY LINK-----"
     branch: main
     buildCommand: "cd client && npm ci && npm run build"
     publishPath: "client/dist"
