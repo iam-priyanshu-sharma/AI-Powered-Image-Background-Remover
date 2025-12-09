@@ -1,3 +1,4 @@
+import axios from "axios";
 import { Webhook } from "svix";
 import userModel from "../models/userModel.js";
 import transactionModel from "../models/transactionModel.js";
@@ -11,105 +12,262 @@ const razorpayInstance = new razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-// API Controller Function to Manage Clerk User with database
+// robust clerkWebhooks - place this in server/controllers/UserController.js replacing the old function
+// requires axios import at top: import axios from "axios";
 const clerkWebhooks = async (req, res) => {
+  const start = Date.now();
+
+  // small helpers
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const retry = async (fn, attempts = 3, delay = 500) => {
+    let lastErr;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        return await fn();
+      } catch (err) {
+        lastErr = err;
+        await sleep(delay * (i + 1));
+      }
+    }
+    throw lastErr;
+  };
+
   try {
-    console.log("➡️ Incoming Clerk webhook");
+    console.log("➡ Incoming Clerk webhook");
 
-    // 1️⃣ Create the webhook verifier
+    // verify signature quickly
     const whook = new Webhook(process.env.CLERK_WEBHOOK_SECRET);
-
-    // 2️⃣ Convert the raw Buffer body to string
     const rawBody = req.body.toString();
 
-    // 3️⃣ Verify signature using the raw body
+    const verifyStart = Date.now();
     await whook.verify(rawBody, {
       "svix-id": req.headers["svix-id"],
       "svix-timestamp": req.headers["svix-timestamp"],
       "svix-signature": req.headers["svix-signature"],
     });
+    console.log("✅ Webhook verified in", Date.now() - verifyStart, "ms");
 
-    // 4️⃣ Parse JSON after verifying
-    const { data, type } = JSON.parse(rawBody);
-
-    console.log("✅ Webhook verified:", type);
-
-    // 5️⃣ Handle event types
-    switch (type) {
-      case "user.created": {
-        // 🧠 safely extract email for all Clerk payload formats
-        let email = "";
-        if (
-          Array.isArray(data.email_addresses) &&
-          data.email_addresses.length > 0
-        ) {
-          const primary =
-            data.email_addresses.find(
-              (e) => e.id === data.primary_email_address_id
-            ) || data.email_addresses[0];
-          email = primary?.email_address || "";
-        } else if (data.email_address) {
-          email = data.email_address;
-        }
-
-        if (!email) {
-          console.warn(
-            "⚠ Clerk user.created event missing email. Skipping DB creation for:",
-            data.id
-          );
-          return res.json({ success: false, message: "No email in payload" });
-        }
-
-        const userData = {
-          clerkId: data.id,
-          email,
-          firstName: data.first_name || "",
-          lastName: data.last_name || "",
-          photo: data.image_url || "",
-          creditBalance: 5, // optional: give 5 free credits to new users
-        };
-
-        await userModel.create(userData);
-        console.log("✅ User created:", userData.email);
-        return res.json({ success: true });
-      }
-
-      case "user.updated": {
-        const primaryEmailObj = Array.isArray(data.email_addresses)
-          ? data.email_addresses.find(
-              (emailObj) => emailObj.id === data.primary_email_address_id
-            ) || data.email_addresses[0]
-          : null;
-
-        const email =
-          primaryEmailObj?.email_address || data.email_address || "";
-
-        const userData = {
-          email,
-          firstName: data.first_name || "",
-          lastName: data.last_name || "",
-          photo: data.image_url || "",
-        };
-
-        await userModel.findOneAndUpdate({ clerkId: data.id }, userData);
-        console.log("✅ User updated:", email);
-        res.json({ success: true });
-        break;
-      }
-
-      case "user.deleted": {
-        await userModel.findOneAndDelete({ clerkId: data.id });
-        console.log("🗑️ User deleted:", data.id);
-        return res.json({ success: true });
-      }
-
-      default:
-        console.log("⚠️ Unknown event type:", type);
-        return res.json({ success: true });
+    // parse payload
+    let payload;
+    try {
+      payload = JSON.parse(rawBody);
+    } catch (err) {
+      console.error("Webhook parse error:", err);
+      return res.status(400).json({ success: false, message: "Invalid JSON" });
     }
+    const { data, type } = payload;
+
+    // ACK Clerk quickly to avoid timeout/retry
+    res.status(200).json({ success: true });
+    console.log("ACK sent to Clerk in", Date.now() - start, "ms");
+
+    // background processing (fire-and-forget)
+    setImmediate(async () => {
+      try {
+        console.log("➡ Background processing:", type);
+
+        // helper: fetch clerk user if email missing (non-blocking)
+        const fetchClerkUser = async (clerkId) => {
+          if (!process.env.CLERK_API_KEY || !clerkId) return null;
+          const url = `https://api.clerk.com/v1/users/${clerkId}`;
+          return await retry(
+            async () => {
+              const resp = await axios.get(url, {
+                headers: {
+                  Authorization: `Bearer ${process.env.CLERK_API_KEY}`,
+                  Accept: "application/json",
+                },
+                timeout: 3000,
+              });
+              return resp.data;
+            },
+            2,
+            500
+          );
+        };
+
+        switch (type) {
+          case "user.created": {
+            // extract email if present
+            let email = "";
+            if (
+              Array.isArray(data.email_addresses) &&
+              data.email_addresses.length > 0
+            ) {
+              const primary =
+                data.email_addresses.find(
+                  (e) => e.id === data.primary_email_address_id
+                ) || data.email_addresses[0];
+              email = primary?.email_address || "";
+            } else if (data.email_address) {
+              email = data.email_address;
+            }
+
+            // try to fetch from Clerk API if email missing (non-blocking)
+            if (!email && data.id) {
+              try {
+                const clerkUser = await fetchClerkUser(data.id);
+                if (clerkUser) {
+                  if (
+                    Array.isArray(clerkUser.email_addresses) &&
+                    clerkUser.email_addresses.length
+                  ) {
+                    const primary =
+                      clerkUser.email_addresses.find(
+                        (e) => e.id === clerkUser.primary_email_address_id
+                      ) || clerkUser.email_addresses[0];
+                    email = primary?.email_address || "";
+                  } else if (clerkUser.email_address) {
+                    email = clerkUser.email_address;
+                  }
+                }
+              } catch (err) {
+                console.warn(
+                  "Clerk API fetch failed (non-blocking):",
+                  err.message || err
+                );
+              }
+            }
+
+            const userData = {
+              clerkId: data.id,
+              ...(email ? { email } : {}),
+              firstName: data.first_name || "",
+              lastName: data.last_name || "",
+              photo: data.image_url || "",
+              creditBalance: 5,
+            };
+
+            // upsert with retries (avoids duplicate-key on retries)
+            try {
+              await retry(
+                async () => {
+                  const filter = data.id
+                    ? { clerkId: data.id }
+                    : email
+                    ? { email }
+                    : {};
+                  const update = {
+                    $setOnInsert: {
+                      clerkId: userData.clerkId,
+                      ...(email ? { email } : {}),
+                      firstName: userData.firstName,
+                      lastName: userData.lastName,
+                      photo: userData.photo,
+                      creditBalance: userData.creditBalance,
+                    },
+                  };
+                  await userModel.findOneAndUpdate(filter, update, {
+                    upsert: true,
+                    new: true,
+                    setDefaultsOnInsert: true,
+                  });
+                },
+                3,
+                400
+              );
+              console.log(
+                "✅ User created/upserted:",
+                userData.clerkId || userData.email
+              );
+            } catch (err) {
+              console.error("❌ User upsert failed:", err.message || err);
+            }
+            break;
+          }
+
+          case "user.updated": {
+            const primaryEmailObj = Array.isArray(data.email_addresses)
+              ? data.email_addresses.find(
+                  (emailObj) => emailObj.id === data.primary_email_address_id
+                ) || data.email_addresses[0]
+              : null;
+            const email =
+              primaryEmailObj?.email_address || data.email_address || "";
+
+            const userData = {
+              ...(email ? { email } : {}),
+              firstName: data.first_name || "",
+              lastName: data.last_name || "",
+              photo: data.image_url || "",
+            };
+
+            try {
+              await retry(
+                async () => {
+                  await userModel.findOneAndUpdate(
+                    { clerkId: data.id },
+                    { $set: userData }
+                  );
+                },
+                2,
+                400
+              );
+              console.log("✅ User updated:", data.id);
+            } catch (err) {
+              console.error("❌ User update failed:", err.message || err);
+            }
+            break;
+          }
+
+          case "user.deleted": {
+            try {
+              const ids = [data.id, data.user_id, data.userId].filter(Boolean);
+              const filters = [];
+              if (ids.length) filters.push({ clerkId: { $in: ids } });
+
+              let email = "";
+              if (
+                Array.isArray(data.email_addresses) &&
+                data.email_addresses.length
+              ) {
+                const primary =
+                  data.email_addresses.find(
+                    (e) => e.id === data.primary_email_address_id
+                  ) || data.email_addresses[0];
+                email = primary?.email_address || "";
+              } else if (data.email_address) {
+                email = data.email_address;
+              }
+              if (email) filters.push({ email });
+
+              if (filters.length === 0) {
+                console.warn("user.deleted had no ID or email:", data);
+                break;
+              }
+
+              await retry(
+                async () => {
+                  await userModel.findOneAndDelete({ $or: filters });
+                },
+                2,
+                300
+              );
+
+              console.log("🗑 User deleted:", JSON.stringify(filters));
+            } catch (err) {
+              console.error("❌ User delete failed:", err.message || err);
+            }
+            break;
+          }
+
+          default:
+            console.log("ℹ Unknown Clerk event (ignored):", type);
+            break;
+        }
+      } catch (bgErr) {
+        console.error(
+          "❌ Background webhook processing error:",
+          bgErr.message || bgErr
+        );
+      } finally {
+        console.log("Background processing finished for webhook type", type);
+      }
+    }); // end setImmediate
   } catch (error) {
-    console.error("❌ Webhook error:", error.message);
-    res.status(400).json({ success: false, message: error.message });
+    console.error("❌ Webhook signature/parse error:", error.message || error);
+    // signature failure -> respond 400 (Clerk won't retry on bad signature)
+    return res.status(400).json({ success: false, message: error.message });
   }
 };
 
